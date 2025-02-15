@@ -1,149 +1,182 @@
+import datetime
 import logging
-from datetime import datetime
 import requests
 import voluptuous as vol
+from dateutil import parser  # Added for robust ISO 8601 parsing
 
-import homeassistant.helpers.config_validation as cv
 from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+import homeassistant.helpers.config_validation as cv
+from homeassistant.util import Throttle
 
 _LOGGER = logging.getLogger(__name__)
 
 # Configuration keys
 CONF_API_KEY = "api_key"
 CONF_OPERATOR_REF = "operator_ref"
-CONF_MONITORING_REF = "monitoring_ref"
-CONF_LINE_REF = "line_ref"
+CONF_LINE_REF = "line_ref"  # default if departure doesn't override
+CONF_DEPARTURES = "departures"
+
+# Each departure should have a name and monitoring_ref, and can optionally specify a route.
+DEPARTURE_SCHEMA = vol.Schema({
+    vol.Required("name"): cv.string,
+    vol.Required("monitoring_ref"): cv.string,
+    vol.Optional("route"): cv.string,
+})
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_API_KEY): cv.string,
     vol.Required(CONF_OPERATOR_REF): cv.string,
-    vol.Required(CONF_MONITORING_REF): cv.string,
     vol.Required(CONF_LINE_REF): cv.string,
+    vol.Optional(CONF_DEPARTURES, default=[]): vol.All(cv.ensure_list, [DEPARTURE_SCHEMA])
 })
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    """Set up the MTA Bus Time sensor from YAML configuration."""
-    api_key = config.get(CONF_API_KEY)
-    operator_ref = config.get(CONF_OPERATOR_REF)
-    monitoring_ref = config.get(CONF_MONITORING_REF)
-    line_ref = config.get(CONF_LINE_REF)
+MIN_TIME_BETWEEN_UPDATES = datetime.timedelta(seconds=60)
 
-    add_entities([MTABusSensor(api_key, operator_ref, monitoring_ref, line_ref)], True)
+class MTAData:
+    """Handles fetching data for multiple departures."""
 
-class MTABusSensor(SensorEntity):
-    """Representation of an MTA Bus Time sensor configured via YAML."""
-
-    def __init__(self, api_key, operator_ref, monitoring_ref, line_ref):
+    def __init__(self, api_key, operator_ref, departures):
         self._api_key = api_key
         self._operator_ref = operator_ref
-        self._monitoring_ref = monitoring_ref
-        self._line_ref = line_ref
+        self._departures = departures  # List of departure dicts
+        self.info = {}  # Dictionary mapping departure name -> list of arrivals
+
+    @Throttle(MIN_TIME_BETWEEN_UPDATES)
+    def update(self):
+        """Fetch data for all departures."""
+        new_info = {}
+        base_url = "https://bustime.mta.info/api/siri/stop-monitoring.json?"
+        for dep in self._departures:
+            dep_name = dep["name"]
+            monitoring_ref = dep["monitoring_ref"]
+            route = dep.get("route")
+            url = f"{base_url}key={self._api_key}&OperatorRef={self._operator_ref}&MonitoringRef={monitoring_ref}"
+            if route:
+                url += f"&LineRef={route}"
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code != 200:
+                    _LOGGER.error("HTTP error %s fetching data for %s", response.status_code, dep_name)
+                    new_info[dep_name] = []
+                    continue
+
+                data = response.json()
+                delivery = (data.get("Siri", {})
+                              .get("ServiceDelivery", {})
+                              .get("StopMonitoringDelivery", []))
+                arrivals = []
+                if delivery:
+                    visits = delivery[0].get("MonitoredStopVisit", [])
+                    for visit in visits:
+                        journey = visit.get("MonitoredVehicleJourney", {})
+                        call = journey.get("MonitoredCall", {})
+                        extensions = call.get("Extensions", {})
+                        distances = extensions.get("Distances", {})
+                        capacities = extensions.get("Capacities", {})
+
+                        raw_aat = call.get("AimedArrivalTime")
+                        raw_eat = call.get("ExpectedArrivalTime")
+                        aimed_dt = None
+                        expected_dt = None
+                        if raw_aat:
+                            try:
+                                aimed_dt = parser.parse(raw_aat)
+                            except Exception as e:
+                                _LOGGER.error("Error parsing AimedArrivalTime for %s: %s", dep_name, e)
+                        if raw_eat:
+                            try:
+                                expected_dt = parser.parse(raw_eat)
+                            except Exception as e:
+                                _LOGGER.error("Error parsing ExpectedArrivalTime for %s: %s", dep_name, e)
+
+                        aimed_formatted = aimed_dt.strftime("%B %d, %Y at %I:%M %p") if aimed_dt else "Unavailable"
+                        expected_formatted = expected_dt.strftime("%B %d, %Y at %I:%M %p") if expected_dt else "Unavailable"
+
+                        arrival = {
+                            "Route": journey.get("PublishedLineName"),
+                            "Destination": journey.get("DestinationName"),
+                            "Current Vehicle Location": journey.get("VehicleLocation"),
+                            "Progress Rate": journey.get("ProgressRate"),
+                            "Aimed Arrival Time": aimed_formatted,
+                            "Estimated Arrival Time": expected_formatted,
+                            "Distance": distances.get("PresentableDistance") or "Unavailable",
+                            "Distance (m)": distances.get("DistanceFromCall"),
+                            "Passenger Count": capacities.get("EstimatedPassengerCount"),
+                            "Passenger Capacity": capacities.get("EstimatedPassengerCapacity"),
+                            "Stop Name": call.get("StopPointName")
+                        }
+                        arrivals.append(arrival)
+                new_info[dep_name] = arrivals
+            except Exception as e:
+                _LOGGER.error("Error fetching data for %s: %s", dep_name, e)
+                new_info[dep_name] = []
+        self.info = new_info
+
+# The rest of your code remains the same.
+class MTABusStopSensor(SensorEntity):
+    """Sensor for a specific departure/stop."""
+
+    def __init__(self, data, departure):
+        """Initialize sensor for a single departure."""
+        self.data = data
+        self._dep_config = departure
+        self._dep_name = departure["name"]
+        self._attr_name = f"MTA Arrival - {self._dep_name}"
+        self._attr_icon = "mdi:bus"
         self._state = None
         self._attributes = {}
-        self._name = "MTA Bus Arrival"
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
 
     @property
     def state(self):
-        """Return the main state (first arrival's Estimated Arrival Time in friendly format)."""
-        return self._state
+        """Return the first arrival's Estimated Arrival Time for this departure."""
+        arrivals = self.data.info.get(self._dep_name, [])
+        if arrivals and arrivals[0].get("Estimated Arrival Time") != "Unavailable":
+            return arrivals[0].get("Estimated Arrival Time")
+        return "No arrivals"
 
     @property
     def extra_state_attributes(self):
-        """Return additional attributes including the list of arrivals and ETA in minutes."""
-        return self._attributes
+        """Return additional attributes including all arrivals and ETA info."""
+        arrivals = self.data.info.get(self._dep_name, [])
+        attrs = {"Arrivals": arrivals, "Monitoring Ref": self._dep_config.get("monitoring_ref")}
+        eta_str = "N/A"
+        if arrivals and arrivals[0].get("Estimated Arrival Time") != "Unavailable":
+            try:
+                expected_dt = datetime.strptime(arrivals[0].get("Estimated Arrival Time"), "%B %d, %Y at %I:%M %p")
+                now_dt = datetime.now(expected_dt.tzinfo)
+                delta = expected_dt - now_dt
+                minutes = int(delta.total_seconds() // 60)
+                eta_str = f"in {minutes} minutes" if minutes >= 0 else "Departed"
+            except Exception as e:
+                _LOGGER.error("Error computing ETA for %s: %s", self._dep_name, e)
+                eta_str = "N/A"
+        attrs["ETA in minutes"] = eta_str
+        # Add new attribute "Arrives" with the same value (or you can adjust the formatting)
+        attrs["Arrives"] = eta_str
+        return attrs
+
 
     def update(self):
-        """Fetch data from the MTA SIRI API, extract multiple arrivals and update the sensor."""
-        url = (
-            f"https://bustime.mta.info/api/siri/stop-monitoring.json?"
-            f"key={self._api_key}&OperatorRef={self._operator_ref}"
-            f"&MonitoringRef={self._monitoring_ref}&LineRef={self._line_ref}"
-        )
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code != 200:
-                _LOGGER.error("HTTP error %s fetching data", response.status_code)
-                self._state = "Error"
-                return
+        """Update sensor state from the shared data."""
+        self.data.update()
+        arrivals = self.data.info.get(self._dep_name, [])
+        if arrivals and arrivals[0].get("Estimated Arrival Time") != "Unavailable":
+            self._state = arrivals[0].get("Estimated Arrival Time")
+        else:
+            self._state = "No arrivals"
+        self._attributes = self.extra_state_attributes
 
-            data = response.json()
-            delivery = (
-                data.get("Siri", {})
-                    .get("ServiceDelivery", {})
-                    .get("StopMonitoringDelivery", [])
-            )
-            arrivals = []
-            if delivery:
-                visits = delivery[0].get("MonitoredStopVisit", [])
-                for visit in visits:
-                    journey = visit.get("MonitoredVehicleJourney", {})
-                    call = journey.get("MonitoredCall", {})
-                    extensions = call.get("Extensions", {})
-                    distances = extensions.get("Distances", {})  # Use this for distance info
-                    capacities = extensions.get("Capacities", {})
+def setup_platform(hass, config, add_entities, discovery_info=None):
+    """Set up MTA Bus Time sensors via YAML configuration."""
+    api_key = config.get(CONF_API_KEY)
+    operator_ref = config.get(CONF_OPERATOR_REF)
+    departures = config.get(CONF_DEPARTURES)
 
-                    # Raw ISO timestamp strings
-                    raw_aat = call.get("AimedArrivalTime")
-                    raw_eat = call.get("ExpectedArrivalTime")
-                    
-                    # Convert raw strings to datetime objects if available
-                    aimed_dt = None
-                    expected_dt = None
-                    if raw_aat:
-                        try:
-                            aimed_dt = datetime.fromisoformat(raw_aat)
-                        except Exception as e:
-                            _LOGGER.error("Error parsing AimedArrivalTime: %s", e)
-                    if raw_eat:
-                        try:
-                            expected_dt = datetime.fromisoformat(raw_eat)
-                        except Exception as e:
-                            _LOGGER.error("Error parsing ExpectedArrivalTime: %s", e)
+    # Create a shared data object that will fetch data for all departures.
+    data = MTAData(api_key, operator_ref, departures)
+    data.update()  # Initial update
 
-                    # Format timestamps in a friendly manner
-                    aimed_formatted = aimed_dt.strftime("%B %d, %Y at %I:%M %p") if aimed_dt else "Unavailable"
-                    expected_formatted = expected_dt.strftime("%B %d, %Y at %I:%M %p") if expected_dt else "Unavailable"
-
-                    # Build a friendly dictionary for this arrival with more readable attribute names
-                    arrival = {
-                        "Route": journey.get("PublishedLineName"),
-                        "Destination": journey.get("DestinationName"),
-                        "Current Vehicle Location": journey.get("VehicleLocation"),  # Dict with 'Latitude' and 'Longitude'
-                        "Progress Rate": journey.get("ProgressRate"),
-                        "Aimed Arrival Time": aimed_formatted,
-                        "Estimated Arrival Time": expected_formatted,
-                        "Distance": distances.get("PresentableDistance") or "Unavailable",
-                        "Distance (m)": distances.get("DistanceFromCall"),
-                        "Passenger Count": capacities.get("EstimatedPassengerCount"),
-                        "Passenger Capacity": capacities.get("EstimatedPassengerCapacity"),
-                        "Stop Name": call.get("StopPointName")
-                    }
-                    arrivals.append(arrival)
-                # Set main sensor state and compute ETA in minutes for the first arrival
-                if arrivals:
-                    first_arrival = arrivals[0]
-                    self._state = first_arrival.get("Estimated Arrival Time")
-                    eta_in_minutes = "N/A"
-                    if expected_dt:
-                        now_dt = datetime.now(expected_dt.tzinfo)
-                        delta = expected_dt - now_dt
-                        minutes = int(delta.total_seconds() // 60)
-                        eta_in_minutes = f"in {minutes} minutes" if minutes >= 0 else "Departed"
-                else:
-                    self._state = "No arrivals"
-            else:
-                self._state = "No data"
-
-            # Save attributes: list of arrivals and ETA for the first arrival
-            self._attributes = {"Arrivals": arrivals}
-            if arrivals:
-                self._attributes["ETA in minutes"] = eta_in_minutes
-
-        except Exception as e:
-            _LOGGER.error("Error fetching MTA bus data: %s", e)
-            self._state = "Error"
+    sensors = []
+    for dep in departures:
+        sensors.append(MTABusStopSensor(data, dep))
+    add_entities(sensors, True)
