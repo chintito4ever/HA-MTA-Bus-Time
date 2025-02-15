@@ -1,0 +1,12 @@
+{
+  "domain": "mta_bus_time",
+  "name": "MTA Bus Time",
+  "version": "0.1.0",
+  "documentation": "https://your-docs-link.example.com",
+  "requirements": [
+    "requests"
+  ],
+  "dependencies": [],
+  "codeowners": []
+}
+
