@@ -142,8 +142,10 @@ class MTABusStopSensor(SensorEntity):
         eta_str = "N/A"
         if arrivals and arrivals[0].get("Estimated Arrival Time") != "Unavailable":
             try:
-                expected_dt = datetime.strptime(arrivals[0].get("Estimated Arrival Time"), "%B %d, %Y at %I:%M %p")
-                now_dt = datetime.now(expected_dt.tzinfo)
+                expected_dt = datetime.datetime.strptime(
+                    arrivals[0].get("Estimated Arrival Time"), "%B %d, %Y at %I:%M %p"
+                )
+                now_dt = datetime.datetime.now(expected_dt.tzinfo)
                 delta = expected_dt - now_dt
                 minutes = int(delta.total_seconds() // 60)
                 eta_str = f"in {minutes} minutes" if minutes >= 0 else "Departed"
