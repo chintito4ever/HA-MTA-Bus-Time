@@ -25,3 +25,5 @@ sensor:
 ```
 
 Each entry under `departures` represents a stop to monitor.
+
+<img width="1410" height="1515" alt="image" src="https://github.com/user-attachments/assets/c9e26ace-e045-4d3e-bff1-34a7414475a6" />
